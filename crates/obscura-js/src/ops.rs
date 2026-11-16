@@ -8783,6 +8783,10 @@ pub fn build_extension() -> Extension {
         op_binding_called(),
         op_fetch_text_sync(),
         op_post_port_message(),
+        op_ws_open(),
+        op_ws_send(),
+        op_ws_next(),
+        op_ws_close(),
         op_subtle_digest(),
         op_subtle_hmac(),
         op_subtle_aes_gcm(),
@@ -10337,4 +10341,120 @@ fn op_scroll_to(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
     sample_live_document_animations(&mut gs);
     let (x, y) = clamp_scroll_offset_for_geometry(&mut gs, (x as f32, y as f32));
     format!("{{\"x\":{},\"y\":{}}}", x, y)
+}
+
+
+// ---- WebSocket that (Ngu Anh 16/11/2026) ----
+// Ban goc: class WebSocket gia (send bo, khong co tin ve). ChatGPT 11/2026 day chu tra loi qua WebSocket -> treo.
+type NguAnhWsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+struct NguAnhWs {
+    sink: Mutex<futures_util::stream::SplitSink<NguAnhWsStream, tokio_tungstenite::tungstenite::Message>>,
+    stream: Mutex<futures_util::stream::SplitStream<NguAnhWsStream>>,
+    cancel: Rc<CancelHandle>,
+}
+impl Resource for NguAnhWs {
+    fn name(&self) -> std::borrow::Cow<'_, str> { "nguAnhWebSocket".into() }
+    fn close(self: Rc<Self>) { self.cancel.cancel(); }
+}
+#[derive(serde::Serialize)]
+struct NguAnhWsEvent { t: &'static str, s: String, code: u16 }
+
+#[op2]
+#[string]
+async fn op_ws_open(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+    #[string] protocols: String,
+    #[string] origin: String,
+    #[string] user_agent: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let err = |e: String| deno_error::JsErrorBox::generic(format!("WebSocket: {e}"));
+    let parsed = url::Url::parse(&url).map_err(|e| err(e.to_string()))?;
+    let mut http_url = parsed.clone();
+    let _ = http_url.set_scheme(if parsed.scheme() == "wss" { "https" } else { "http" });
+    let jar = {
+        let sb = state.borrow();
+        let gs = sb.borrow::<SharedState>().clone();
+        let gs = gs.borrow();
+        gs.cookie_jar.clone()
+    };
+    let cookie = jar.as_ref().map(|j| j.get_cookie_header(&http_url)).unwrap_or_default();
+    let mut req = url.as_str().into_client_request().map_err(|e| err(e.to_string()))?;
+    {
+        let h = req.headers_mut();
+        if !origin.is_empty() && origin != "null" { if let Ok(v) = origin.parse() { h.insert("Origin", v); } }
+        if !user_agent.is_empty() { if let Ok(v) = user_agent.parse() { h.insert("User-Agent", v); } }
+        if !cookie.is_empty() { if let Ok(v) = cookie.parse() { h.insert("Cookie", v); } }
+        if !protocols.is_empty() { if let Ok(v) = protocols.parse() { h.insert("Sec-WebSocket-Protocol", v); } }
+    }
+    let (ws, resp) = tokio::time::timeout(std::time::Duration::from_secs(30), tokio_tungstenite::connect_async(req)).await
+        .map_err(|_| err("qua 30 s chua mo duoc".into()))?
+        .map_err(|e| err(e.to_string()))?;
+    if let Some(j) = jar.as_ref() {
+        for v in resp.headers().get_all("set-cookie") { if let Ok(sc) = v.to_str() { j.set_cookie(sc, &http_url); } }
+    }
+    let protocol = resp.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let extensions = resp.headers().get("sec-websocket-extensions").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let (sink, stream) = futures_util::StreamExt::split(ws);
+    let rid = state.borrow_mut().resource_table.add(NguAnhWs { sink: Mutex::new(sink), stream: Mutex::new(stream), cancel: CancelHandle::new_rc() });
+    Ok(serde_json::json!({ "rid": rid, "protocol": protocol, "extensions": extensions }).to_string())
+}
+
+#[op2]
+async fn op_ws_send(
+    state: Rc<RefCell<OpState>>,
+    #[smi] rid: u32,
+    #[string] text: String,
+    #[buffer] data: JsBuffer,
+    binary: bool,
+) -> Result<(), deno_error::JsErrorBox> {
+    use tokio_tungstenite::tungstenite::Message;
+    let res = state.borrow().resource_table.get::<NguAnhWs>(rid).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let msg = if binary { Message::Binary(data.to_vec().into()) } else { Message::Text(text.into()) };
+    let mut sink = res.sink.lock().await;
+    futures_util::SinkExt::send(&mut *sink, msg).await.map_err(|e| deno_error::JsErrorBox::generic(format!("WebSocket: {e}")))
+}
+
+#[op2]
+#[serde]
+async fn op_ws_next(state: Rc<RefCell<OpState>>, #[smi] rid: u32) -> Result<NguAnhWsEvent, deno_error::JsErrorBox> {
+    use tokio_tungstenite::tungstenite::Message;
+    let res = match state.borrow().resource_table.get::<NguAnhWs>(rid) {
+        Ok(r) => r,
+        Err(_) => return Ok(NguAnhWsEvent { t: "close", s: String::new(), code: 1006 }),
+    };
+    let cancel = res.cancel.clone();
+    let mut st = res.stream.lock().await;
+    loop {
+        let next = futures_util::StreamExt::next(&mut *st).or_cancel(cancel.clone()).await;
+        return Ok(match next {
+            Err(_) | Ok(None) => NguAnhWsEvent { t: "close", s: String::new(), code: 1006 },
+            Ok(Some(Err(e))) => NguAnhWsEvent { t: "error", s: e.to_string(), code: 1006 },
+            Ok(Some(Ok(Message::Text(t)))) => NguAnhWsEvent { t: "text", s: t.to_string(), code: 0 },
+            Ok(Some(Ok(Message::Binary(b)))) => NguAnhWsEvent { t: "binary", s: BASE64.encode(&b[..]), code: 0 },
+            Ok(Some(Ok(Message::Close(f)))) => {
+                let (code, reason) = f.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1005, String::new()));
+                NguAnhWsEvent { t: "close", s: reason, code }
+            }
+            Ok(Some(Ok(_))) => continue,
+        });
+    }
+}
+
+#[op2]
+async fn op_ws_close(
+    state: Rc<RefCell<OpState>>,
+    #[smi] rid: u32,
+    #[smi] code: u32,
+    #[string] reason: String,
+) -> Result<(), deno_error::JsErrorBox> {
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    let res = match state.borrow().resource_table.get::<NguAnhWs>(rid) { Ok(r) => r, Err(_) => return Ok(()) };
+    let mut sink = res.sink.lock().await;
+    let frame = CloseFrame { code: (code as u16).into(), reason: reason.into() };
+    let _ = futures_util::SinkExt::send(&mut *sink, Message::Close(Some(frame))).await;
+    let _ = futures_util::SinkExt::flush(&mut *sink).await;
+    Ok(())
 }
