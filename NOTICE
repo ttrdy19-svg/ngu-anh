@@ -1,0 +1,9 @@
+Ngư Ảnh
+Bản sửa đổi của Obscura (https://github.com/h4ckf0r0day/obscura), phát hành theo Apache License 2.0.
+
+Thay đổi so với bản gốc (11/2026, Duy TTD Studio):
+- crates/obscura-js/src/ops.rs: op tải script đồng bộ cho importScripts; op WebSocket thật (op_ws_open/send/next/close).
+- crates/obscura-js/js/bootstrap.js: DataTransfer, input.files, contenteditable/insertText, blob: giữ byte + fetch(blob:),
+  MessagePort xuyên khung, canPlayType, WebSocket dùng op thật, vết lỗi Worker.
+- crates/obscura-cdp/src/domains/runtime.rs, input.rs: awaitPromise không giới hạn thời gian, nhập chữ.
+- README.md mới (README gốc đổi tên README-OBSCURA.md), thêm NOTICE này.
