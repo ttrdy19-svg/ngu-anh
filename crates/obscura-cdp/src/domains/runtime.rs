@@ -11,6 +11,7 @@ pub(crate) struct DeferredEvaluation {
     return_by_value: bool,
     pub(crate) deadline: tokio::time::Instant,
     command_deadline: Option<tokio::time::Instant>,
+    command_budget_ms: u64,
     timeout_ms: u64,
     method: String,
 }
@@ -29,7 +30,10 @@ impl DeferredEvaluation {
             js.cancel_cdp_evaluation(self.pending);
             return Err("Execution context was destroyed".into());
         }
-        let remaining = self.command_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+        // Ngu Anh: the command budget bounds synchronous V8 work, not the time a page promise takes to settle
+        // (Chrome has no such limit). Give the final settle+serialize step a fresh budget.
+        let _ = self.command_deadline;
+        let remaining = (self.command_budget_ms != 0).then(|| std::time::Duration::from_millis(self.command_budget_ms));
         if remaining.is_some_and(|budget| budget.is_zero()) {
             js.cancel_cdp_evaluation(self.pending);
             return Err("Runtime evaluation exceeded its command budget".into());
@@ -63,10 +67,12 @@ pub(crate) async fn start_awaited_evaluation(
     let field = if method == "evaluate" { "contextId" } else { "executionContextId" };
     let frame_id = validate_context(params, field, ctx, session_id, method)?;
     let return_by_value = params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false);
-    let timeout_ms = params.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
+    // Ngu Anh: Chrome waits for awaitPromise without a default timeout; long page jobs (Flow, Dreamina) take minutes.
+    let timeout_ms = params.get("timeout").and_then(Value::as_u64).unwrap_or(86_400_000);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let command_deadline = (command_budget_ms != 0).then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(command_budget_ms));
-    let deadline = command_deadline.map_or(deadline, |command| deadline.min(command));
+    let _ = &command_deadline;
+    let command_deadline: Option<tokio::time::Instant> = None;
     let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
     let Some(js) = page.js.as_mut() else { return Ok(None); };
     let evaluation = if method == "evaluate" {
@@ -89,7 +95,7 @@ pub(crate) async fn start_awaited_evaluation(
     // Finish this task's promise reactions before a script-initiated navigation.
     js.resolve_promises_until(|js| js.cdp_evaluation_ready(&pending), 0).await;
     Ok(Some(DeferredEvaluation {
-        page_id: page.id.clone(), pending, return_by_value, deadline, command_deadline, timeout_ms, method: method.into(),
+        page_id: page.id.clone(), pending, return_by_value, deadline, command_deadline, command_budget_ms, timeout_ms, method: method.into(),
     }))
 }
 

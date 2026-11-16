@@ -5031,6 +5031,13 @@ class Element extends Node {
     if ((this.getAttribute('type') || '').toLowerCase() !== 'file') return null;
     return this._files || _emptyFileList();
   }
+  // Ngu Anh: Chrome cho gan input.files = dataTransfer.files (trang/tien ich nap tep bang cach nay).
+  set files(list) {
+    if (this.localName !== 'input' || (this.getAttribute('type') || '').toLowerCase() !== 'file') return;
+    if (list == null) return;
+    const arr = []; for (let i = 0; i < (list.length | 0); i++) arr.push(list[i]);
+    this._files = _makeFileList(arr);
+  }
   set value(v) {
     const tag = this.localName;
     if (tag === 'option') {
@@ -7247,7 +7254,14 @@ class Document extends Node {
     // must not advertise clipboard or formatting actions that do nothing.
     return false;
   }
-  execCommand() { return false; }
+  // Ngu Anh: minimal editing commands for contenteditable hosts (pages type via execCommand('insertText')).
+  execCommand(commandId, showUI, value) {
+    const c = String(commandId).toLowerCase();
+    if (c === 'inserttext') return !!(globalThis.__ngu_editInsert && globalThis.__ngu_editInsert(String(value == null ? '' : value)));
+    if (c === 'selectall') return !!(globalThis.__ngu_editSelectAll && globalThis.__ngu_editSelectAll());
+    if (c === 'delete' || c === 'forwarddelete') return !!(globalThis.__ngu_editDelete && globalThis.__ngu_editDelete());
+    return false;
+  }
 }
 
 // Shared by write and the final EOF flush. A nonnegative parent is a real node,
@@ -7663,6 +7677,18 @@ class HTMLImageElement extends Element {
       }
       this._applyImageMetadata(metadata, request, true);
     };
+    // Ngu Anh: the Rust image loader only fetches over the network; blob: images exist only in page memory.
+    {
+      const srcNow = String(this._imageCurrentSrc || this.src || '');
+      if (srcNow.startsWith('blob:')) {
+        const entry = globalThis.__nguBlobBytes && globalThis.__nguBlobBytes.get(srcNow.split('#')[0]);
+        const dim = entry ? _nguImageSize(entry.bytes) : null;
+        Promise.resolve().then(() => finish(dim
+          ? { ok: true, currentSrc: srcNow, width: dim[0], height: dim[1] }
+          : { ok: false, currentSrc: srcNow }));
+        return;
+      }
+    }
     try {
       const op = __obscuraCore.ops.op_load_image_metadata;
       if (typeof op === "function") {
@@ -7687,6 +7713,8 @@ class HTMLImageElement extends Element {
   }
 
   _refreshImageFromCache(deferCompletion) {
+    // Ngu Anh: blob: images are decoded in JS; the Rust cache knows nothing about them.
+    { const blobSrc = String(this.src || ''); if (blobSrc.startsWith('blob:')) { if (this._imageCurrentSrc !== blobSrc) this._adoptImageCandidate(blobSrc); return; } }
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
@@ -7819,7 +7847,23 @@ class HTMLMediaElement extends Element {
   static HAVE_CURRENT_DATA = 2;
   static HAVE_FUTURE_DATA = 3;
   static HAVE_ENOUGH_DATA = 4;
-  canPlayType(_type) { return ''; }
+  // Ngu Anh: answer like Chrome so players (Flow, YouTube-like widgets) render their <video>. Nothing is decoded here;
+  // automation only needs the media URL the page assigns.
+  canPlayType(type) {
+    const t = String(type == null ? '' : type).toLowerCase().trim();
+    const m = t.match(/^([a-z]+\/[a-z0-9.+-]+)\s*(?:;\s*codecs\s*=\s*"?([^"]*)"?)?/);
+    if (!m) return '';
+    const mime = m[1], codecs = (m[2] || '').split(',').map(c => c.trim()).filter(Boolean);
+    const ok = {
+      'video/mp4': /^(avc1|avc3|mp4a|av01|vp09|vp9|opus|flac|hev1|hvc1)/, 'audio/mp4': /^(mp4a|opus|flac)/, 'audio/aac': /^$/,
+      'video/webm': /^(vp8|vp9|vp09|vp8\.0|vp9\.0|av01|opus|vorbis)/, 'audio/webm': /^(opus|vorbis)/,
+      'audio/mpeg': /^(mp3)?$/, 'audio/mp3': /^$/, 'audio/ogg': /^(opus|vorbis|flac)/, 'video/ogg': /^(theora|vorbis|opus)/,
+      'audio/wav': /^(1)?$/, 'audio/x-wav': /^(1)?$/, 'audio/wave': /^(1)?$/, 'audio/flac': /^$/,
+    }[mime];
+    if (!ok) return '';
+    if (!codecs.length) return mime === 'audio/mpeg' || mime === 'audio/mp3' || mime === 'audio/flac' ? 'probably' : 'maybe';
+    return codecs.every(c => ok.test(c)) ? 'probably' : '';
+  }
   load() {}
   play() {
     return Promise.reject(new DOMException(
@@ -8860,6 +8904,13 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
+  // Ngu Anh: blob: URLs live in this realm's memory; answer them here with the real bytes.
+  if (typeof url === 'string' && url.startsWith('blob:')) {
+    const entry = globalThis.__nguBlobBytes && globalThis.__nguBlobBytes.get(url.split('#')[0]);
+    if (!entry) throw new TypeError('Failed to fetch');
+    const copy = new Uint8Array(entry.bytes);
+    return new Response(copy, { status: 200, statusText: 'OK', headers: { 'Content-Type': entry.type || 'application/octet-stream', 'Content-Length': String(copy.length) } });
+  }
   // Normalize the method to uppercase, matching the Request constructor, so
   // fetch(url, {method:"delete"}) and new Request(url, {method:"delete"}) agree
   // and lowercase standard methods are not rejected by the case-sensitive CORS
@@ -16445,15 +16496,19 @@ function _serializeFrameMessage(data) {
   return json;
 }
 
-function _sendContextMessage(contextId, data, targetOrigin) {
+function _sendContextMessage(contextId, data, targetOrigin, transfer /* Ngu Anh: transfer */) {
   const frameId = __obscuraCore.ops.op_frame_relation(contextId, 5, 0, '');
-  if (frameId >= 0) return _sendRealmMessage(frameId, data, targetOrigin);
+  if (frameId >= 0) return _sendRealmMessage(frameId, data, targetOrigin, transfer);
   _serializeFrameMessage(data);
   if (targetOrigin !== undefined && targetOrigin !== null) String(targetOrigin);
 }
 
-function _sendRealmMessage(targetFrameId, data, targetOrigin) {
-  const json = _serializeFrameMessage(data);
+function _sendRealmMessage(targetFrameId, data, targetOrigin, transfer) {
+  // Ngu Anh: postMessage(data, { targetOrigin, transfer }) form, and MessagePorts in the transfer list.
+  if (targetOrigin !== null && typeof targetOrigin === 'object') { transfer = targetOrigin.transfer; targetOrigin = targetOrigin.targetOrigin; }
+  const nguPorts = _nguPortsIn(transfer);
+  let json = _serializeFrameMessage(data);
+  if (nguPorts.length && targetFrameId !== _realmFrameId) json = _nguAttachPorts(json, nguPorts, targetFrameId);
   // An unspecified targetOrigin stays permissive (empty string); the receiver
   // enforces a specified one against its own origin in __obscura_deliverMessage.
   const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
@@ -16466,7 +16521,7 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   setTimeout(() => {
     try {
       globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-        new MessageEvent('message', { data: clone, origin, source: globalThis })));
+        new MessageEvent('message', { data: clone, origin, source: globalThis, ports: nguPorts })));
     } catch (error) {
       console.error('message listener failed:', error && error.message || error);
     }
@@ -16582,7 +16637,7 @@ function _frameWindowFor(frameId) {
   const parentId = Reflect.get(real, '__obscura_parentFrameId') || 0;
   const contextId = __obscuraCore.ops.op_frame_context(frameId);
   const post = _markNative(function (data, targetOrigin, _transfer) {
-    _sendContextMessage(contextId, data, targetOrigin);
+    _sendContextMessage(contextId, data, targetOrigin, _transfer);
   });
   const win = new Proxy(real, {
     get(target, prop) {
@@ -16607,12 +16662,17 @@ function _frameWindowFor(frameId) {
 
 // The host calls this inside the target realm.
 globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin, sourceContextId = -1) {
+  // Ngu Anh: traffic of a MessagePort that crossed frames.
+  let nguEnv = null;
+  try { nguEnv = JSON.parse(dataJson); } catch (_) {}
+  if (nguEnv && nguEnv.pm) { _nguPortDeliver(nguEnv); return; }
   // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
   // origin, the same check a real browser does at delivery time. A mismatch
   // drops the message silently.
   if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) return;
   let data = null;
   try { data = JSON.parse(dataJson).v; } catch (_) {}
+  const nguReceived = (nguEnv && Array.isArray(nguEnv.np)) ? _nguMakeInPorts(nguEnv.np, sourceFrameId) : [];
   // Who to reply to: the frame above, or one of the frames below.
   const source = sourceContextId >= 0 ? _windowForContext(sourceContextId)
     : (globalThis.__obscura_frameId !== 0
@@ -16625,7 +16685,7 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
     // drop anything untrusted, so an untrusted event is not merely suspicious,
     // it is silently discarded and the widget waits forever.
     globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-      new MessageEvent('message', { data, origin, source })));
+      new MessageEvent('message', { data, origin, source, ports: nguReceived })));
   } catch (error) {
     console.error('message listener failed:', error && error.message || error);
   }
@@ -16652,7 +16712,7 @@ function _windowForContext(contextId) {
 // is for.
 class _RemoteWindow {
   postMessage(data, targetOrigin, _transfer) {
-    _sendContextMessage(_remoteContextId(this), data, targetOrigin);
+    _sendContextMessage(_remoteContextId(this), data, targetOrigin, _transfer);
   }
   get self() { return this.closed ? null : this; }
   get window() { return this.closed ? null : this; }
@@ -16839,7 +16899,7 @@ class _IframeWindow {
     // the document inside its iframe. A frame that has not loaded yet has no
     // browsing context to receive anything.
     if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data, targetOrigin);
+    _sendRealmMessage(this._frameId, data, targetOrigin, _transfer);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -17670,6 +17730,7 @@ globalThis.Worker = class Worker {
       if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
         try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
       }
+      worker._baseUrl = resolvedUrl;
       (async () => {
         try {
           const resp = await fetch(resolvedUrl);
@@ -17698,6 +17759,19 @@ globalThis.Worker = class Worker {
         scope._ev[type].push(fn);
       },
       close: () => { worker.terminate(); },
+      // Ngu Anh: importScripts dong bo (op Rust op_fetch_text_sync), chay trong pham vi worker.
+      importScripts: (...urls) => {
+        for (const u of urls) {
+          let abs = String(u);
+          try { abs = new URL(abs, worker._baseUrl || globalThis.location?.href || '').href; } catch (e) {}
+          let code = globalThis.__blobStore?.[abs];
+          if (code === undefined) {
+            code = __obscuraCore.ops.op_fetch_text_sync(abs);
+            if (code.charCodeAt(0) === 0) throw new DOMException("Failed to execute 'importScripts': " + abs + ' ' + code.slice(5), 'NetworkError');
+          }
+          (new Function('scope', 'source', 'with (scope) { eval(source); }')).call(scope, scope, code);
+        }
+      },
       crypto: globalThis.crypto,
       Crypto: globalThis.Crypto,
       TextEncoder: globalThis.TextEncoder,
@@ -17740,7 +17814,7 @@ globalThis.Worker = class Worker {
       const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
       fn.call(scope, scope, this._code);
     } catch(e) {
-      console.error('Worker error:', e.message);
+      console.error('Worker error:', e.message, '| worker:', String(this._baseUrl || '(blob)').slice(0, 160), '| stack:', String(e && e.stack || '').split(String.fromCharCode(10)).slice(0, 6).join(' <- '));
       if (this.onerror) this.onerror(e);
     } finally {
       if (!this._terminated) {
@@ -17765,7 +17839,7 @@ globalThis.Worker = class Worker {
         const evs = (scope._ev && scope._ev['message']) || [];
         for (const handler of evs.slice()) handler.call(scope, event);
       } catch(e) {
-        console.error('Worker error:', e.message);
+        console.error('Worker error:', e.message, '| worker:', String(this._baseUrl || '(blob)').slice(0, 160), '| stack:', String(e && e.stack || '').split(String.fromCharCode(10)).slice(0, 6).join(' <- '));
         if (worker.onerror) worker.onerror(e);
       }
     }, 0);
@@ -17832,11 +17906,16 @@ URL.createObjectURL = function(blob) {
     } else {
       globalThis.__blobStore[id] = '';
     }
+    // Ngu Anh: keep the real bytes too (the text copy above is lossy for binary data such as images).
+    if (!globalThis.__nguBlobBytes) globalThis.__nguBlobBytes = new Map();
+    if (blob._bytes) globalThis.__nguBlobBytes.set(id, { bytes: blob._bytes, type: String(blob.type || '') });
+    else if (typeof blob.arrayBuffer === 'function') blob.arrayBuffer().then(b => { globalThis.__nguBlobBytes.set(id, { bytes: new Uint8Array(b), type: String(blob.type || '') }); }, () => {});
     return id;
   }
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
+  if (globalThis.__nguBlobBytes) globalThis.__nguBlobBytes.delete(String(url));
 };
 
 // Window-level scrolling (issue #468). #431 gave elements functional
@@ -17916,7 +17995,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
 globalThis.postMessage = function(data, targetOrigin, _transfer) {
-  _sendRealmMessage(_realmFrameId, data, targetOrigin);
+  _sendRealmMessage(_realmFrameId, data, targetOrigin, _transfer);
 };
 _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
@@ -20435,6 +20514,265 @@ if (typeof globalThis.__obscura_snapshot_compile === 'function') {
     _ensureWindowNamedProperty, _windowNamedNamesInTree, _registerWindowNamedTree,
     _reconcileWindowNamedProperties, _installFramingRelationships,
   ]);
+}
+
+// ===== Ngu Anh (16/11/2026) =====
+// DataTransfer: Chrome co san; trang/tien ich dung DataTransfer de gan input.files hoac gia keo-tha tep.
+if (typeof DataTransfer === "undefined") {
+  class DataTransferItem {
+    constructor(kind, type, data) { this._kind = kind; this._type = type; this._data = data; }
+    get kind() { return this._kind; }
+    get type() { return this._type; }
+    getAsFile() { return this._kind === "file" ? this._data : null; }
+    getAsString(cb) { if (this._kind === "string" && typeof cb === "function") setTimeout(() => cb(this._data), 0); }
+    get [Symbol.toStringTag]() { return "DataTransferItem"; }
+  }
+  class DataTransferItemList {
+    constructor(dt) { Object.defineProperty(this, "_dt", { value: dt }); }
+    get length() { return this._dt._items.length; }
+    add(data, type) {
+      let item;
+      if (data instanceof File) item = new DataTransferItem("file", data.type || "", data);
+      else {
+        const t = String(type || "").toLowerCase();
+        if (this._dt._items.some(i => i.kind === "string" && i.type === t)) throw new DOMException("An item already exists for type '" + t + "'.", "NotSupportedError");
+        item = new DataTransferItem("string", t, String(data));
+      }
+      this._dt._items.push(item); return item;
+    }
+    remove(i) { this._dt._items.splice(i | 0, 1); }
+    clear() { this._dt._items.length = 0; }
+    [Symbol.iterator]() { return this._dt._items[Symbol.iterator](); }
+    get [Symbol.toStringTag]() { return "DataTransferItemList"; }
+  }
+  globalThis.DataTransfer = class DataTransfer {
+    constructor() {
+      Object.defineProperty(this, "_items", { value: [] });
+      Object.defineProperty(this, "_list", { value: new DataTransferItemList(this) });
+      this.dropEffect = "none"; this.effectAllowed = "all";
+    }
+    get items() {
+      const list = this._list;
+      return new Proxy(list, { get: (t, k) => (typeof k === "string" && /^\d+$/.test(k)) ? t._dt._items[+k] : Reflect.get(t, k, t) });
+    }
+    get files() { return _makeFileList(this._items.filter(i => i.kind === "file").map(i => i._data)); }
+    get types() { const t = this._items.map(i => i.kind === "file" ? "Files" : i.type); return [...new Set(t)]; }
+    getData(type) { const t = String(type).toLowerCase(); const i = this._items.find(x => x.kind === "string" && x.type === (t === "text" ? "text/plain" : t)); return i ? i._data : ""; }
+    setData(type, data) { let t = String(type).toLowerCase(); if (t === "text") t = "text/plain"; this.clearData(t); this._items.push(new DataTransferItem("string", t, String(data))); }
+    clearData(type) { for (let k = this._items.length - 1; k >= 0; k--) { const i = this._items[k]; if (i.kind === "string" && (type === undefined || i.type === String(type).toLowerCase())) this._items.splice(k, 1); } }
+    setDragImage() {}
+    get [Symbol.toStringTag]() { return "DataTransfer"; }
+  };
+  globalThis.DataTransferItem = DataTransferItem;
+  globalThis.DataTransferItemList = DataTransferItemList;
+}
+// WebIDL: thuoc tinh/ham tren prototype cua giao dien DOM la enumerable (Chrome liet ke duoc). Bootstrap khai bang class JS
+// nen an -> thu vien assets-retry (Dreamina) boc the script bang for...in ra the rong: "f.setAttribute is not a function".
+(() => {
+  const HO = /^(HTML|SVG|CSS|DOM)[A-Z]|^(EventTarget|Node|Element|Document|DocumentFragment|DocumentType|CharacterData|Text|Comment|CDATASection|ProcessingInstruction|Attr|NodeList|HTMLCollection|NamedNodeMap|Window|Navigator|Location|History|Screen|Storage|Range|Selection|ShadowRoot|MutationObserver|MutationRecord|IntersectionObserver|ResizeObserver|XMLHttpRequest|XMLHttpRequestEventTarget|XMLHttpRequestUpload|FormData|Blob|File|FileList|FileReader|URL|URLSearchParams|Headers|Request|Response|AbortController|AbortSignal|Performance|TreeWalker|StyleSheet|StyleSheetList|MediaQueryList|ValidityState|TextMetrics|ImageData|CanvasRenderingContext2D|Path2D|Image|Audio|Option|DataTransfer|DataTransferItem|DataTransferItemList)$|Event$/;
+  const done = new Set();
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (!HO.test(name)) continue;
+    let C; try { C = globalThis[name]; } catch (e) { continue; }
+    const proto = C && C.prototype;
+    if (typeof C !== "function" || !proto || done.has(proto)) continue;
+    done.add(proto);
+    for (const k of Object.getOwnPropertyNames(proto)) {
+      if (k === "constructor" || k.charAt(0) === "_") continue;
+      try { const d = Object.getOwnPropertyDescriptor(proto, k); if (d && !d.enumerable && d.configurable) { d.enumerable = true; Object.defineProperty(proto, k, d); } } catch (e) {}
+    }
+  }
+})();
+
+// ===== Ngu Anh: contenteditable editing =====
+(() => {
+  const hostOf = (n) => {
+    for (let e = n && (n.nodeType === 1 ? n : n.parentNode); e && e.nodeType === 1; e = e.parentNode) {
+      if (e.hasAttribute && e.hasAttribute('contenteditable')) {
+        const v = String(e.getAttribute('contenteditable') || '').toLowerCase();
+        if (v === 'false') return null;
+        return e;
+      }
+    }
+    return null;
+  };
+  if (typeof HTMLElement !== 'undefined' && !Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')) {
+    Object.defineProperty(HTMLElement.prototype, 'isContentEditable', { get() { return !!hostOf(this); }, enumerable: true, configurable: true });
+  }
+  const trusted = (e) => (globalThis.__obscura_markTrusted ? globalThis.__obscura_markTrusted(e) : e);
+  const currentHost = () => {
+    const sel = document.getSelection ? document.getSelection() : getSelection();
+    let host = hostOf(document.activeElement);
+    if (!host && sel && sel.rangeCount) host = hostOf(sel.getRangeAt(0).startContainer);
+    return [host, sel];
+  };
+  const caretAtEnd = (host) => {
+    const r = new Range();
+    let t = host;
+    while (t.lastElementChild && /^(P|DIV|H[1-6]|LI|SPAN|BLOCKQUOTE|PRE)$/.test(t.lastElementChild.tagName)) t = t.lastElementChild;
+    const last = t.lastChild;
+    if (last && last.nodeName === 'BR') { r.setStart(t, Array.prototype.indexOf.call(t.childNodes, last)); r.collapse(true); }
+    else if (last && last.nodeType === 3) { r.setStart(last, last.data.length); r.collapse(true); }
+    else { r.selectNodeContents(t); r.collapse(false); }
+    return r;
+  };
+  const setCaret = (sel, node, offset) => {
+    if (!sel) return;
+    const r = new Range(); r.setStart(node, offset); r.collapse(true);
+    sel.removeAllRanges(); sel.addRange(r);
+  };
+  globalThis.__ngu_editInsert = function (text) {
+    const [host, sel] = currentHost();
+    if (!host) return false;
+    const before = trusted(new InputEvent('beforeinput', { bubbles: true, composed: true, cancelable: true, data: text, inputType: 'insertText' }));
+    if (!host.dispatchEvent(before)) return true;
+    let r = (sel && sel.rangeCount && host.contains(sel.getRangeAt(0).startContainer)) ? sel.getRangeAt(0) : caretAtEnd(host);
+    if (!r.collapsed) { r.deleteContents(); r.collapse(true); }
+    let node, offset;
+    if (r.startContainer.nodeType === 3) {
+      node = r.startContainer; const o = r.startOffset;
+      node.data = node.data.slice(0, o) + text + node.data.slice(o); offset = o + text.length;
+    } else {
+      node = document.createTextNode(text); r.insertNode(node); offset = text.length;
+    }
+    setCaret(sel, node, offset);
+    host.dispatchEvent(trusted(new InputEvent('input', { bubbles: true, composed: true, data: text, inputType: 'insertText' })));
+    return true;
+  };
+  globalThis.__ngu_editSelectAll = function () {
+    const [host, sel] = currentHost();
+    if (!host || !sel) return false;
+    const r = new Range(); r.selectNodeContents(host);
+    sel.removeAllRanges(); sel.addRange(r);
+    return true;
+  };
+  globalThis.__ngu_editDelete = function () {
+    const [host, sel] = currentHost();
+    if (!host || !sel || !sel.rangeCount) return false;
+    const r = sel.getRangeAt(0);
+    if (r.collapsed || !host.contains(r.startContainer)) return false;
+    const before = trusted(new InputEvent('beforeinput', { bubbles: true, composed: true, cancelable: true, inputType: 'deleteContentBackward' }));
+    if (!host.dispatchEvent(before)) return true;
+    const whole = r.startContainer === host && r.startOffset === 0 && r.endContainer === host && r.endOffset === host.childNodes.length;
+    r.deleteContents();
+    if (whole || !host.firstChild) { const p = document.createElement('p'); p.appendChild(document.createElement('br')); host.appendChild(p); setCaret(sel, p, 0); }
+    else { r.collapse(true); }
+    host.dispatchEvent(trusted(new InputEvent('input', { bubbles: true, composed: true, inputType: 'deleteContentBackward' })));
+    return true;
+  };
+})();
+
+// ===== Ngu Anh: image size from bytes =====
+function _nguImageSize(b) {
+  if (!b || b.length < 24) return null;
+  const be16 = i => (b[i] << 8) | b[i + 1], le16 = i => b[i] | (b[i + 1] << 8);
+  const be32 = i => ((b[i] << 24) >>> 0) + ((b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]);
+  const le32 = i => (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16)) + ((b[i + 3] << 24) >>> 0);
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return [be32(16), be32(20)];
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return [le16(6), le16(8)];
+  if (b[0] === 0x42 && b[1] === 0x4D) return [le32(18), Math.abs(le32(22) | 0)];
+  if (b[0] === 0xFF && b[1] === 0xD8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xFF) { i++; continue; }
+      const m = b[i + 1];
+      if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
+      const len = be16(i + 2);
+      if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) return [be16(i + 7), be16(i + 5)];
+      i += 2 + len;
+    }
+    return null;
+  }
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) {
+    const kind = String.fromCharCode(b[12], b[13], b[14], b[15]);
+    if (kind === 'VP8 ') return [le16(26) & 0x3FFF, le16(28) & 0x3FFF];
+    if (kind === 'VP8L') { const n = le32(21); return [(n & 0x3FFF) + 1, ((n >> 14) & 0x3FFF) + 1]; }
+    if (kind === 'VP8X') return [1 + (b[24] | (b[25] << 8) | (b[26] << 16)), 1 + (b[27] | (b[28] << 8) | (b[29] << 16))];
+  }
+  return null;
+}
+
+// ===== Ngu Anh: contentEditable property =====
+(() => {
+  const P = (typeof HTMLElement !== 'undefined' && HTMLElement.prototype) || (typeof Element !== 'undefined' && Element.prototype);
+  if (P && !('contentEditable' in P)) {
+    Object.defineProperty(P, 'contentEditable', {
+      get() {
+        if (!this.hasAttribute('contenteditable')) return 'inherit';
+        const v = String(this.getAttribute('contenteditable') || '').toLowerCase();
+        return v === '' || v === 'true' ? 'true' : v === 'plaintext-only' ? 'plaintext-only' : v === 'false' ? 'false' : 'inherit';
+      },
+      set(v) {
+        const x = String(v).toLowerCase();
+        if (x === 'inherit') this.removeAttribute('contenteditable');
+        else if (x === 'true' || x === 'false' || x === 'plaintext-only') this.setAttribute('contenteditable', x);
+        else throw new DOMException("Failed to set the 'contentEditable' property on 'HTMLElement': The value provided ('" + v + "') is not one of 'true', 'false', 'plaintext-only', or 'inherit'.", 'SyntaxError');
+      },
+      enumerable: true, configurable: true,
+    });
+  }
+})();
+
+// ===== Ngu Anh: MessagePort across frames =====
+const _nguOut = new Map();   // id -> the real port kept in the sending realm
+const _nguIn = new Map();    // id -> local channel end in the receiving realm
+function _nguPortsIn(transfer) {
+  const out = [];
+  if (!transfer || typeof transfer[Symbol.iterator] !== 'function') return out;
+  for (const t of transfer) if (typeof MessagePort === 'function' && t instanceof MessagePort) out.push(t);
+  return out;
+}
+function _nguEncode(value) {
+  return JSON.stringify(value === undefined ? null : value, function (k, v) {
+    if (v instanceof ArrayBuffer) v = { __ngu_ab: 1, b: _nguB64(new Uint8Array(v)) };
+    else if (ArrayBuffer.isView && ArrayBuffer.isView(v) && !(v instanceof DataView)) v = { __ngu_ta: v.constructor.name, b: _nguB64(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) };
+    return v;
+  });
+}
+function _nguDecode(json) {
+  return JSON.parse(json, function (k, v) {
+    if (v && typeof v === 'object') {
+      if (v.__ngu_ab === 1) return _nguUnB64(v.b).buffer;
+      if (v.__ngu_ta) { const C = globalThis[v.__ngu_ta]; const u = _nguUnB64(v.b); return typeof C === 'function' ? new C(u.buffer, u.byteOffset, u.byteLength / (C.BYTES_PER_ELEMENT || 1)) : u; }
+    }
+    return v;
+  });
+}
+function _nguB64(u) { let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); }
+function _nguUnB64(b) { const s = atob(b); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+function _nguPortSend(frameId, id, data) {
+  const st = globalThis.__nguPortStats || (globalThis.__nguPortStats = { sent: 0, recv: 0, miss: 0, err: 0, last: '' });
+  st.sent++;
+  let d;
+  try { d = _nguEncode(data); } catch (e) { st.err++; st.last = String(e && e.message); console.error('Ngu Anh port message not cloneable:', e && e.message); return; }
+  if (!__obscuraCore.ops.op_post_port_message((frameId | 0) >>> 0, (_realmFrameId | 0) >>> 0, '{"v":null,"pm":' + JSON.stringify(id) + ',"d":' + JSON.stringify(d) + '}')) { st.err++; st.last = 'post returned false to frame ' + frameId; }
+}
+function _nguAttachPorts(json, ports, targetFrameId) {
+  const ids = [];
+  for (const port of ports) {
+    const id = 'p' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    _nguOut.set(id, port);
+    port.onmessage = (ev) => _nguPortSend(targetFrameId, id, ev.data);
+    ids.push(id);
+  }
+  return json.slice(0, -1) + ',"np":' + JSON.stringify(ids) + '}';
+}
+function _nguMakeInPorts(ids, sourceFrameId) {
+  const ports = [];
+  for (const id of ids) {
+    const ch = new MessageChannel();
+    _nguIn.set(id, ch.port2);
+    ch.port2.onmessage = (ev) => _nguPortSend(sourceFrameId, id, ev.data);
+    ports.push(ch.port1);
+  }
+  return ports;
+}
+function _nguPortDeliver(env) {
+  let data = null;
+  try { data = _nguDecode(env.d); } catch (_) {}
+  const st = globalThis.__nguPortStats || (globalThis.__nguPortStats = { sent: 0, recv: 0, miss: 0, err: 0, last: '' });
+  const local = _nguIn.get(env.pm) || _nguOut.get(env.pm);
+  if (local) { st.recv++; local.postMessage(data); } else st.miss++;
 }
 
 })();

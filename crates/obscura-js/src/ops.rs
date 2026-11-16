@@ -7130,6 +7130,27 @@ fn op_post_frame_message(
     true
 }
 
+// Ngu Anh: traffic of a MessagePort that crossed frames. The port callback runs inside a task the page realm
+// entered, so op_post_frame_message would read the page as the sender (and drop frame->page posts as self-posts).
+// The JS side routes these by port id, so it passes its own frame id explicitly.
+#[op2(fast)]
+fn op_post_port_message(state: &OpState, target_frame_id: u32, source_frame_id: u32, #[string] data_json: &str) -> bool {
+    if target_frame_id == source_frame_id { return false; }
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    if gs.pending_frame_messages.len() >= frame_message_queue_entry_limit() { return false; }
+    gs.pending_frame_message_bytes = gs.pending_frame_message_bytes.saturating_add(data_json.len());
+    gs.pending_frame_messages.push(PendingFrameMessage {
+        target_frame_id,
+        source_frame_id,
+        source_context_id: None,
+        origin: "null".to_string(),
+        target_origin: String::new(),
+        data_json: data_json.to_string(),
+    });
+    true
+}
+
 /// Resolves after `millis`, as the timer source for child frame realms.
 ///
 /// deno_core's own timer queue is not usable from a frame: `op_timer_queue`
@@ -7598,6 +7619,30 @@ fn posted_task_owner(state: &OpState, frame_id: u32) -> Option<SharedState> {
     if registry.frame_timers_active(frame_id) != Some(true) { return None; }
     let owner = registry.by_frame_id(frame_id);
     owner
+}
+
+// Ngư Ảnh: tải đồng bộ một script cho importScripts() trong Worker (Worker được giả lập trong luồng trang,
+// importScripts theo chuẩn là đồng bộ). Chạy trên luồng riêng có runtime tokio riêng để không chặn/đụng runtime chính.
+#[op2]
+#[string]
+fn op_fetch_text_sync(#[string] url: String) -> String {
+    let handle = std::thread::spawn(move || -> Result<String, String> {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+        rt.block_on(async move {
+            let client = reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+                .timeout(std::time::Duration::from_secs(30))
+                .build().map_err(|e| e.to_string())?;
+            let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() { return Err(format!("HTTP {}", resp.status())); }
+            resp.text().await.map_err(|e| e.to_string())
+        })
+    });
+    match handle.join() {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => format!("\u{0}ERR:{}", e),
+        Err(_) => "\u{0}ERR:thread panic".to_string(),
+    }
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
@@ -8736,6 +8781,8 @@ pub fn build_extension() -> Extension {
         op_posted_task(),
         op_posted_task_generation(),
         op_binding_called(),
+        op_fetch_text_sync(),
+        op_post_port_message(),
         op_subtle_digest(),
         op_subtle_hmac(),
         op_subtle_aes_gcm(),

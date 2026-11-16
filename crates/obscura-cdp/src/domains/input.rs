@@ -26,7 +26,7 @@ fn insert_text_js(text: &str, ime_commit: bool) -> String {
     format!(
         "(function() {{\
             var t = document.activeElement;\
-            if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) {{ if (globalThis.__ngu_editInsert) globalThis.__ngu_editInsert({text}); return; }}\
             if (globalThis.__obscura_isDisabled(t)) return;\
             if (!{ime_commit} && t.hasAttribute('readonly')) return;\
             var ins = {text};\
