@@ -27610,6 +27610,8 @@ mod tests {
     }
 
     #[test]
+    // Ngư Ảnh: canPlayType trả như Chrome ("maybe" cho video/mp4, "probably" khi có codec) để trang web chịu dùng phần video
+    // (Flow, Muse, Dreamina); trạng thái phát vẫn trung thực: chưa tải gì, readyState 0, paused.
     fn unsupported_media_capabilities_and_readiness_are_honest() {
         let mut rt = setup_runtime(
             r#"<video id="media" src="https://example.test/movie.mp4"
@@ -27636,8 +27638,8 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                "",
-                "",
+                "maybe",
+                "probably",
                 0,
                 0,
                 0,
